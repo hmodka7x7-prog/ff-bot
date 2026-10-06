@@ -1,0 +1,1079 @@
+const { ChannelType, PermissionsBitField } = require('discord.js');
+const { note } = require('./ui');
+const fs = require('fs');
+const path = require('path');
+let config;
+try { config = require('../config.json'); } catch { config = {}; }
+if (!config.modes) config.modes = {};
+if (!config.modes.amo) config.modes.amo = {};
+if (!config.modes.esport) config.modes.esport = {};
+if (process.env.AMO_VOICE_CATEGORY_ID) config.modes.amo.voiceCategoryId = process.env.AMO_VOICE_CATEGORY_ID;
+if (process.env.ESPORTS_VOICE_CATEGORY_ID) config.modes.esport.voiceCategoryId = process.env.ESPORTS_VOICE_CATEGORY_ID;
+if (!config.modes.amo.voiceCategoryId) config.modes.amo.voiceCategoryId = '1545316338145165332';
+if (!config.modes.esport.voiceCategoryId) config.modes.esport.voiceCategoryId = '1545386731686076476';
+if (process.env.ROOM_CATEGORY_ID) config.roomCategoryId = process.env.ROOM_CATEGORY_ID;
+if (!config.roomCategoryId) config.roomCategoryId = '1545316338145165332';
+if (!config.matchViewerRoles) {
+  config.matchViewerRoles = process.env.MATCH_VIEWER_ROLE_IDS ? process.env.MATCH_VIEWER_ROLE_IDS.split(',').map(s => s.trim()).filter(Boolean) : ['1466082863115145441'];
+}
+if (!config.matchPingRoles) {
+  config.matchPingRoles = process.env.MATCH_PING_ROLE_IDS ? process.env.MATCH_PING_ROLE_IDS.split(',').map(s => s.trim()).filter(Boolean) : ['1548338723593392198', '1537318639395545139', '1506540916519731310', '1546807156970487838', '1547776062400888912', '1548350425462210570', '1549201615850971216', '1548350896428158976', '1466082863115145441'];
+}
+
+function staffVoiceOverwrites() {
+  const rows = [];
+  for (const roleId of (config.matchPingRoles || [])) {
+    if (!roleId) continue;
+    rows.push({ id: roleId, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.Connect] });
+  }
+  return rows;
+}
+
+const activeMatches = new Map();
+const MATCHES_FILE = path.resolve(__dirname, '..', 'data', 'matches.json');
+const LOGS_FILE = path.resolve(__dirname, '..', 'data', 'matches_log.json');
+const suppressedUsers = new Map();
+const restoringPlayers = new Map();
+// Both maps are one-shot flags consumed by the next VoiceStateUpdate for that
+// player. They need a TTL because the matching event may never arrive (the
+// player disconnects mid-teardown), and without one the entry leaks forever.
+const SUPPRESS_TTL_MS = 120000;
+const RESTORE_TTL_MS = 120000;
+const VOICE_POOL_SIZE = parseInt(process.env.VOICE_POOL_SIZE || '0') || (config.voicePoolSize || 5);
+const voicePool = new Map();
+const poolInUse = new Map();
+
+function markPoolInUse(mode, ids) {
+  if (!ids || !ids.length) return;
+  if (!poolInUse.has(mode)) poolInUse.set(mode, new Set());
+  for (const id of ids) poolInUse.get(mode).add(id);
+}
+
+function releasePoolInUse(mode, ids) {
+  if (!ids || !ids.length) return;
+  const set = poolInUse.get(mode);
+  if (!set) return;
+  for (const id of ids) set.delete(id);
+}
+
+function isRealId(id) {
+  return typeof id === 'string' && /^\d{15,20}$/.test(id);
+}
+
+function isRestoring(userId) {
+  if (userId === undefined || userId === null) return false;
+  const key = String(userId);
+  const entry = restoringPlayers.get(key);
+  if (entry === undefined) return false;
+  if (entry.expiresAt <= Date.now()) {
+    restoringPlayers.delete(key);
+    return false;
+  }
+  return true;
+}
+
+function beginRestore(match) {
+  const expiresAt = Date.now() + RESTORE_TTL_MS;
+  for (const userId of Object.keys(match.originalChannels || {})) {
+    restoringPlayers.set(String(userId), { matchId: match.id, expiresAt });
+  }
+}
+
+function endRestore(match) {
+  for (const userId of Object.keys(match.originalChannels || {})) {
+    const key = String(userId);
+    const entry = restoringPlayers.get(key);
+    if (entry && entry.matchId === match.id) restoringPlayers.delete(key);
+  }
+}
+
+function endRestoreUser(match, userId) {
+  const key = String(userId);
+  const entry = restoringPlayers.get(key);
+  if (entry && entry.matchId === match.id) restoringPlayers.delete(key);
+}
+
+// Both of the maps above are only cleared by the teardown that created them.
+// If that teardown is interrupted (crash, restart mid-cleanup) the entries used
+// to stay forever, permanently marking players as "restoring" or "suppressed"
+// and making the bot ignore their future voice-state changes.
+function sweepEphemeralFlags() {
+  const now = Date.now();
+  for (const [key, entry] of restoringPlayers) {
+    if (!entry || entry.expiresAt <= now) restoringPlayers.delete(key);
+  }
+  for (const [key, expiresAt] of suppressedUsers) {
+    if (expiresAt <= now) suppressedUsers.delete(key);
+  }
+}
+
+function clearOriginalChannel(match, userId) {
+  if (match.originalChannels && typeof match.originalChannels === 'object' && match.originalChannels[userId] !== undefined) {
+    delete match.originalChannels[userId];
+    persistMatches();
+  }
+}
+
+function ensureLogsFile() {
+  const dir = path.dirname(LOGS_FILE);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  if (!fs.existsSync(LOGS_FILE)) fs.writeFileSync(LOGS_FILE, JSON.stringify([]));
+}
+
+const MAX_MATCH_LOGS = 2000;
+
+function logMatch(entry) {
+  ensureLogsFile();
+  let logs = [];
+  try {
+    logs = JSON.parse(fs.readFileSync(LOGS_FILE, 'utf8'));
+    if (!Array.isArray(logs)) logs = [];
+  } catch (e) {
+    logs = [];
+  }
+  logs.push(entry);
+  // This used to grow without limit, and every entry re-read, re-parsed and
+  // re-serialised the whole file synchronously -- so the cost of finishing a
+  // match kept climbing forever. Capped to match how maintenance.js handles
+  // its own log.
+  if (logs.length > MAX_MATCH_LOGS) logs = logs.slice(-MAX_MATCH_LOGS);
+  fs.writeFileSync(LOGS_FILE, JSON.stringify(logs, null, 2));
+}
+
+function getMatchLogs() {
+  ensureLogsFile();
+  try {
+    const logs = JSON.parse(fs.readFileSync(LOGS_FILE, 'utf8'));
+    return Array.isArray(logs) ? logs : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function suppressUsers(userIds) {
+  const expiresAt = Date.now() + SUPPRESS_TTL_MS;
+  for (const id of userIds) {
+    if (id) suppressedUsers.set(id, expiresAt);
+  }
+}
+
+function isSuppressed(userId) {
+  const expiresAt = suppressedUsers.get(userId);
+  if (expiresAt === undefined) return false;
+  suppressedUsers.delete(userId);
+  return expiresAt > Date.now();
+}
+
+function ensureMatchesFile() {
+  const dir = path.dirname(MATCHES_FILE);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  if (!fs.existsSync(MATCHES_FILE)) fs.writeFileSync(MATCHES_FILE, JSON.stringify([]));
+}
+
+function validateMatch(match) {
+  const issues = [];
+  match.team1 = Array.isArray(match.team1) ? match.team1 : [];
+  match.team2 = Array.isArray(match.team2) ? match.team2 : [];
+  if (match.teamSize && ![2, 3, 4].includes(match.teamSize)) match.teamSize = null;
+  match.team1 = [...new Set(match.team1.filter(id => typeof id === 'string' && /^\d+$/.test(id)))];
+  match.team2 = [...new Set(match.team2.filter(id => typeof id === 'string' && /^\d+$/.test(id)))];
+  if (match.teamSize) {
+    if (match.team1.length > match.teamSize) { match.team1 = match.team1.slice(0, match.teamSize); issues.push('team1-overfull-trimmed'); }
+    if (match.team2.length > match.teamSize) { match.team2 = match.team2.slice(0, match.teamSize); issues.push('team2-overfull-trimmed'); }
+  }
+  match.voiceChannels = Array.isArray(match.voiceChannels) ? match.voiceChannels : [];
+  match.originalChannels = (match.originalChannels && typeof match.originalChannels === 'object') ? match.originalChannels : {};
+  const PHASES = [null, 'CANCELLING', 'CANCELLED', 'FINISHING', 'FINISHED'];
+  if (!PHASES.includes(match.phase)) match.phase = null;
+  match.winnerVotes = (match.winnerVotes && typeof match.winnerVotes === 'object') ? match.winnerVotes : {};
+  match.loserVotes = (match.loserVotes && typeof match.loserVotes === 'object') ? match.loserVotes : {};
+  match.cancelVotes = (match.cancelVotes && typeof match.cancelVotes === 'object') ? match.cancelVotes : { 1: [], 2: [] };
+  if (!Array.isArray(match.cancelVotes[1])) match.cancelVotes[1] = [];
+  if (!Array.isArray(match.cancelVotes[2])) match.cancelVotes[2] = [];
+
+  const crossDup = match.team1.filter(id => match.team2.includes(id));
+  if (crossDup.length) {
+    match.team2 = match.team2.filter(id => !match.team1.includes(id));
+    issues.push('cross-team-duplicates-removed: ' + crossDup.join(','));
+  }
+
+  const roster = new Set([...match.team1, ...match.team2]);
+  for (const key of ['winnerVotes', 'loserVotes']) {
+    for (const uid of Object.keys(match[key])) {
+      const v = match[key][uid];
+      if (!roster.has(uid) || !v || typeof v !== 'object' || (v.team !== 1 && v.team !== 2) || typeof v.player !== 'string' || !v.player) {
+        delete match[key][uid];
+        issues.push(key + '-entry-removed');
+      } else {
+        match[key][uid].team = match.team1.includes(uid) ? 1 : 2;
+      }
+    }
+  }
+
+  if (match.winnerVoteSet && (!match.mvpWinnerId || !match.winnerTeam)) {
+    match.winnerVoteSet = false;
+    issues.push('winner-result-incomplete-cleared');
+  }
+  if (match.loserVoteSet && (!match.mvpLoserId || !match.loserTeam)) {
+    match.loserVoteSet = false;
+    issues.push('loser-result-incomplete-cleared');
+  }
+  if (match.resultStatus !== null && match.resultStatus !== undefined && !match.resultStatus) {
+    match.resultStatus = null;
+    issues.push('result-status-normalized');
+  }
+
+  if (match.status === 'full') {
+    if (!match.teamSize || match.team1.length < match.teamSize || match.team2.length < match.teamSize) {
+      match.status = 'waiting';
+      issues.push('roster-depleted-rolled-back');
+    }
+  } else if (match.status !== 'waiting') {
+    match.status = 'waiting';
+    issues.push('status-normalized');
+  }
+  return { match, issues };
+}
+
+function validateAllMatches() {
+  const repaired = [];
+  let changed = false;
+  for (const [id, match] of activeMatches) {
+    const res = validateMatch(match);
+    if (res.issues.length) {
+      repaired.push({ id, issues: res.issues });
+      changed = true;
+    }
+  }
+  if (changed) persistMatches();
+  return repaired;
+}
+
+function loadMatches() {
+  ensureMatchesFile();
+  try {
+    const data = JSON.parse(fs.readFileSync(MATCHES_FILE, 'utf8'));
+    if (Array.isArray(data)) {
+      let changed = false;
+      data.forEach(m => {
+        if (!m || typeof m !== 'object' || !m.id || !m.creatorId) {
+          changed = true;
+          return;
+        }
+        const res = validateMatch(m);
+        if (res.issues.length) {
+          console.log(`[SELF-HEAL] match ${m.id} repaired on load: ${res.issues.join(', ')}`);
+          changed = true;
+        }
+        activeMatches.set(m.id, m);
+        if (m.usePool && Array.isArray(m.voiceChannels) && m.voiceChannels.length) {
+          markPoolInUse(m.mode || 'amo', m.voiceChannels);
+        }
+      });
+      if (changed) persistMatches();
+    }
+  } catch (e) {
+    console.log('Could not load matches:', e.message);
+  }
+}
+
+function serializeMatch(m) {
+  const copy = { ...m };
+  delete copy.joinTimeout;
+  delete copy.configTimeout;
+  return copy;
+}
+
+function persistMatches() {
+  ensureMatchesFile();
+  const arr = Array.from(activeMatches.values())
+    .filter(m => m.status === 'waiting' || m.status === 'full')
+    .map(serializeMatch);
+  try {
+    fs.writeFileSync(MATCHES_FILE, JSON.stringify(arr, null, 2));
+  } catch (e) {
+    console.log('persistMatches error:', e.message);
+  }
+}
+
+// Bumps the activity clock used by the abandoned-match reaper in
+// cleanupExpired(). Call this whenever a match genuinely changes hands.
+function touchMatch(match) {
+  if (match) match.lastActivityAt = Date.now();
+}
+
+loadMatches();
+
+function createMatch(creatorId, teamSize, channelId, mode = 'amo') {
+  cleanupExpired();
+  const matchId = `${Date.now()}_${creatorId}`;
+  const match = {
+    id: matchId,
+    creatorId,
+    mode,
+    teamSize,
+    channelId,
+    channelId2: null,
+    matchChannelId: null,
+    createdAt: Date.now(),
+    lastActivityAt: Date.now(),
+    team1: [],
+    team2: [],
+    roomId: null,
+    password: null,
+    status: 'waiting',
+    voiceChannels: [],
+    originalChannels: {},
+    winnerId: null,
+    loserId: null,
+    message: null,
+    buttonsMessageId: null,
+    phase: null,
+    joinTimeout: null
+  };
+  activeMatches.set(matchId, match);
+  persistMatches();
+  return match;
+}
+
+// A live match legitimately runs for a long time (a Free Fire round plus setup),
+// so this must stay generous. It exists only to reap matches abandoned because
+// nobody ever settled or cancelled them -- not to interrupt a real game.
+const ABANDONED_FULL_AGE = 4 * 60 * 60 * 1000;
+
+function isStructurallyBroken(match) {
+  // Marked full but never actually given the channels it needs. This is the
+  // state a failed channel creation used to leave behind permanently.
+  return match.status === 'full' &&
+    (!Array.isArray(match.voiceChannels) || match.voiceChannels.length === 0) &&
+    !match.channelId2;
+}
+
+function cleanupExpired() {
+  const MAX_AGE = 10 * 60 * 1000;
+  const now = Date.now();
+  sweepEphemeralFlags();
+  let changed = false;
+  for (const [id, match] of activeMatches) {
+    if (match.status === 'waiting' && now - match.createdAt > MAX_AGE) {
+      activeMatches.delete(id);
+      changed = true;
+      continue;
+    }
+    // Roll a half-created match back to an open lobby so players can use it,
+    // rather than leaving it permanently "full" but unplayable.
+    if (isStructurallyBroken(match)) {
+      match.status = 'waiting';
+      match.phase = null;
+      match.resultStatus = '🔄 Match channels failed to create — the lobby has been reopened. Try joining again.';
+      changed = true;
+      continue;
+    }
+    const lastTouch = match.lastActivityAt || match.createdAt;
+    if (match.status === 'full' && now - lastTouch > ABANDONED_FULL_AGE) {
+      activeMatches.delete(id);
+      changed = true;
+    }
+  }
+  if (changed) persistMatches();
+}
+
+function getMatch(matchId) {
+  cleanupExpired();
+  return activeMatches.get(matchId);
+}
+
+function getMatchByChannel(channelId) {
+  cleanupExpired();
+  for (const [id, match] of activeMatches) {
+    if (match.channelId === channelId && match.status === 'waiting') {
+      return match;
+    }
+  }
+  return null;
+}
+
+function getMatchByCreator(creatorId, mode) {
+  cleanupExpired();
+  for (const [id, match] of activeMatches) {
+    if (match.creatorId === creatorId && match.status === 'waiting' &&
+        (mode ? match.mode === mode : true)) {
+      return match;
+    }
+  }
+  return null;
+}
+
+function joinTeam(matchId, userId, team) {
+  const match = activeMatches.get(matchId);
+  if (!match) return { success: false, error: 'Match not found' };
+  if (match.status !== 'waiting') return { success: false, error: 'Match already started' };
+
+  for (const [id, m] of activeMatches) {
+    if (id === matchId) continue;
+    if (m.status !== 'waiting' && m.status !== 'full') continue;
+    if (m.team1.includes(userId) || m.team2.includes(userId)) {
+      return { success: false, error: 'You are already in another match!' };
+    }
+  }
+
+  const otherTeam = team === 1 ? match.team2 : match.team1;
+  if (otherTeam.includes(userId)) {
+    return { success: false, error: 'You are already in the other team!' };
+  }
+
+  const currentTeam = team === 1 ? match.team1 : match.team2;
+  if (currentTeam.includes(userId)) {
+    return { success: false, error: 'You are already in this team!' };
+  }
+
+  if (currentTeam.length >= match.teamSize) {
+    return { success: false, error: `Team ${team} is full!` };
+  }
+
+  currentTeam.push(userId);
+  touchMatch(match);
+  persistMatches();
+  return { success: true, team1: match.team1, team2: match.team2 };
+}
+
+function leaveMatch(matchId, userId, opts = {}) {
+  const match = activeMatches.get(matchId);
+  if (!match) return { success: false, error: 'Match not found' };
+
+  if (match.status === 'full' && !opts.force) {
+    return { success: false, error: '❌ The match has started! You can only leave by using **Cancel Match** or an admin action.' };
+  }
+
+  const idx1 = match.team1.indexOf(userId);
+  const idx2 = match.team2.indexOf(userId);
+
+  if (idx1 !== -1) {
+    match.team1.splice(idx1, 1);
+    touchMatch(match);
+    persistMatches();
+    return { success: true, team1: match.team1, team2: match.team2 };
+  }
+  if (idx2 !== -1) {
+    match.team2.splice(idx2, 1);
+    touchMatch(match);
+    persistMatches();
+    return { success: true, team1: match.team1, team2: match.team2 };
+  }
+
+  return { success: false, error: 'You are not in this match!' };
+}
+
+function getPlayerTeam(match, userId) {
+  if (!match) return null;
+  if ((match.team1 || []).includes(userId)) return 1;
+  if ((match.team2 || []).includes(userId)) return 2;
+  return null;
+}
+
+function isTeamsFull(matchId) {
+  const match = activeMatches.get(matchId);
+  if (!match) return false;
+  return match.team1.length === match.teamSize && match.team2.length === match.teamSize;
+}
+
+async function ensureVoicePool(guild, mode) {
+  const modeConfig = config.modes[mode] || config.modes.amo;
+  const categoryId = modeConfig.voiceCategoryId;
+  const category = guild.channels.cache.get(categoryId);
+  if (!category) { console.log(`[POOL] No voice category for ${mode}`); return; }
+  if (VOICE_POOL_SIZE <= 0) return;
+
+  const existing = guild.channels.cache.filter(c => c.parentId === categoryId && c.type === ChannelType.GuildVoice);
+  const botMember = guild.members.me;
+  const hiddenOverwrites = [
+    { id: guild.id, deny: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.Connect] }
+  ];
+  if (botMember) {
+    hiddenOverwrites.push({
+      id: botMember.id,
+      allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.Connect, PermissionsBitField.Flags.MoveMembers]
+    });
+  }
+
+  const need = VOICE_POOL_SIZE * 2;
+  const t1Channels = existing.filter(c => c.name.startsWith('🟢'));
+  const t2Channels = existing.filter(c => c.name.startsWith('🔴'));
+
+  for (let i = t1Channels.size; i < VOICE_POOL_SIZE; i++) {
+    try {
+      const ch = await guild.channels.create({
+        name: `🟢 Team 1 - Slot ${i + 1}`,
+        type: ChannelType.GuildVoice,
+        parent: categoryId,
+        permissionOverwrites: hiddenOverwrites,
+      });
+      console.log(`[POOL] Created ${mode} Team 1 slot ${i + 1}: ${ch.id}`);
+    } catch (e) { console.log(`[POOL] Create error: ${e.message}`); }
+  }
+  for (let i = t2Channels.size; i < VOICE_POOL_SIZE; i++) {
+    try {
+      const ch = await guild.channels.create({
+        name: `🔴 Team 2 - Slot ${i + 1}`,
+        type: ChannelType.GuildVoice,
+        parent: categoryId,
+        permissionOverwrites: hiddenOverwrites,
+      });
+      console.log(`[POOL] Created ${mode} Team 2 slot ${i + 1}: ${ch.id}`);
+    } catch (e) { console.log(`[POOL] Create error: ${e.message}`); }
+  }
+
+  const refreshed = guild.channels.cache.filter(c => c.parentId === categoryId && c.type === ChannelType.GuildVoice);
+  const poolT1 = refreshed.filter(c => c.name.startsWith('🟢')).sort((a, b) => slotNum(a.name) - slotNum(b.name)).map(c => c.id);
+  const poolT2 = refreshed.filter(c => c.name.startsWith('🔴')).sort((a, b) => slotNum(a.name) - slotNum(b.name)).map(c => c.id);
+  voicePool.set(mode, { t1: poolT1, t2: poolT2 });
+  console.log(`[POOL] ${mode} pool: ${poolT1.length} T1 + ${poolT2.length} T2 channels`);
+}
+
+function slotNum(name) {
+  const m = String(name).match(/Slot\s*(\d+)/i);
+  return m ? parseInt(m[1], 10) : 999;
+}
+
+function findEmptyChannel(guild, mode, team) {
+  const pool = voicePool.get(mode);
+  if (!pool) return null;
+  const ids = team === 1 ? pool.t1 : pool.t2;
+  const inUse = poolInUse.get(mode);
+  for (const id of ids) {
+    if (inUse && inUse.has(id)) continue;
+    const ch = guild.channels.cache.get(id);
+    if (ch && ch.members.size === 0) return ch;
+  }
+  return null;
+}
+
+async function activatePoolChannels(guild, match, team1Channel, team2Channel) {
+  const botMember = guild.members.me;
+  for (const [ch, teamIds] of [[team1Channel, match.team1], [team2Channel, match.team2]]) {
+    const overwrites = [
+      { id: guild.id, deny: [PermissionsBitField.Flags.Connect], allow: [PermissionsBitField.Flags.ViewChannel] }
+    ];
+    for (const roleId of (config.matchViewerRoles || [])) {
+      if (!roleId) continue;
+      overwrites.push({ id: roleId, allow: [PermissionsBitField.Flags.ViewChannel] });
+    }
+    overwrites.push(...staffVoiceOverwrites());
+    for (const uid of teamIds) {
+      if (!isRealId(uid)) continue;
+      overwrites.push({ id: uid, allow: [PermissionsBitField.Flags.Connect, PermissionsBitField.Flags.ViewChannel] });
+    }
+    if (botMember) {
+      overwrites.push({ id: botMember.id, allow: [PermissionsBitField.Flags.Connect, PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.MoveMembers] });
+    }
+    try { await ch.permissionOverwrites.set(overwrites); } catch (e) { console.log(`[POOL] activate error: ${e.message}`); }
+  }
+}
+
+async function deactivatePoolChannel(guild, channelId) {
+  const ch = guild.channels.cache.get(channelId);
+  if (!ch) return;
+  const botMember = guild.members.me;
+  const hiddenOverwrites = [
+    { id: guild.id, deny: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.Connect] }
+  ];
+  if (botMember) {
+    hiddenOverwrites.push({
+      id: botMember.id,
+      allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.Connect, PermissionsBitField.Flags.MoveMembers]
+    });
+  }
+  try { await ch.permissionOverwrites.set(hiddenOverwrites); } catch (e) { console.log(`[POOL] deactivate error: ${e.message}`); }
+}
+
+async function createVoiceChannels(guild, match) {
+  if (match.voiceChannels && match.voiceChannels.length === 2) {
+    const t1 = await resolveChannel(guild, match.voiceChannels[0]);
+    const t2 = await resolveChannel(guild, match.voiceChannels[1]);
+    if (t1 && t1.type === ChannelType.GuildVoice && t2 && t2.type === ChannelType.GuildVoice) {
+      if (match.usePool) {
+        await activatePoolChannels(guild, match, t1, t2);
+        markPoolInUse(match.mode || 'amo', match.voiceChannels);
+      }
+      return { team1Channel: t1, team2Channel: t2 };
+    }
+    console.log(`[VOICE] match ${match.id}: recorded team channels stale (${match.voiceChannels.join(', ')}) — recreating pair`);
+    match.voiceChannels = [];
+    match.usePool = false;
+  }
+
+  const mode = match.mode || 'amo';
+  const pool = voicePool.get(mode);
+
+  if (pool && VOICE_POOL_SIZE > 0) {
+    const t1ch = findEmptyChannel(guild, mode, 1);
+    const t2ch = findEmptyChannel(guild, mode, 2);
+    if (t1ch && t2ch) {
+      await activatePoolChannels(guild, match, t1ch, t2ch);
+      match.voiceChannels = [t1ch.id, t2ch.id];
+      match.usePool = true;
+      markPoolInUse(mode, match.voiceChannels);
+      console.log(`[POOL] Assigned pool channels for ${mode}: ${t1ch.id} + ${t2ch.id}`);
+      return { team1Channel: t1ch, team2Channel: t2ch };
+    }
+    console.log(`[POOL] No empty pool channels for ${mode}, falling back to create`);
+  }
+
+  const category = guild.channels.cache.get(config.roomCategoryId);
+  const botMember = guild.members.me;
+
+  const team1Overwrites = [
+    { id: guild.id, deny: [PermissionsBitField.Flags.Connect], allow: [PermissionsBitField.Flags.ViewChannel] }
+  ];
+  for (const roleId of (config.matchViewerRoles || [])) {
+    if (!roleId) continue;
+    team1Overwrites.push({ id: roleId, allow: [PermissionsBitField.Flags.ViewChannel] });
+  }
+  team1Overwrites.push(...staffVoiceOverwrites());
+  for (const userId of match.team1) {
+    if (!isRealId(userId)) continue;
+    team1Overwrites.push({ id: userId, allow: [PermissionsBitField.Flags.Connect, PermissionsBitField.Flags.ViewChannel] });
+  }
+  if (botMember) {
+    team1Overwrites.push({ id: botMember.id, allow: [PermissionsBitField.Flags.Connect, PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.MoveMembers] });
+  }
+
+  const team2Overwrites = [
+    { id: guild.id, deny: [PermissionsBitField.Flags.Connect], allow: [PermissionsBitField.Flags.ViewChannel] }
+  ];
+  for (const roleId of (config.matchViewerRoles || [])) {
+    if (!roleId) continue;
+    team2Overwrites.push({ id: roleId, allow: [PermissionsBitField.Flags.ViewChannel] });
+  }
+  team2Overwrites.push(...staffVoiceOverwrites());
+  for (const userId of match.team2) {
+    if (!isRealId(userId)) continue;
+    team2Overwrites.push({ id: userId, allow: [PermissionsBitField.Flags.Connect, PermissionsBitField.Flags.ViewChannel] });
+  }
+  if (botMember) {
+    team2Overwrites.push({ id: botMember.id, allow: [PermissionsBitField.Flags.Connect, PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.MoveMembers] });
+  }
+
+  const team1Channel = await guild.channels.create({
+    name: `🟢 Team 1 - ${match.teamSize}v${match.teamSize}`,
+    type: ChannelType.GuildVoice,
+    parent: category ? category.id : null,
+    permissionOverwrites: team1Overwrites,
+  });
+
+  const team2Channel = await guild.channels.create({
+    name: `🔴 Team 2 - ${match.teamSize}v${match.teamSize}`,
+    type: ChannelType.GuildVoice,
+    parent: category ? category.id : null,
+    permissionOverwrites: team2Overwrites,
+  });
+
+  match.voiceChannels = [team1Channel.id, team2Channel.id];
+  return { team1Channel, team2Channel };
+}
+
+async function createChannel(guild, match) {
+  const category = guild.channels.cache.get(config.roomCategoryId);
+  const botMember = guild.members.me;
+  const overwrites = [
+    {
+      id: guild.id,
+      deny: [PermissionsBitField.Flags.ViewChannel],
+    }
+  ];
+  const allPlayers = [...new Set([...match.team1, ...match.team2])];
+  for (const userId of allPlayers) {
+    if (!isRealId(userId)) continue;
+    overwrites.push({
+      id: userId,
+      allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory],
+    });
+  }
+  for (const roleId of (config.matchViewerRoles || [])) {
+    if (!roleId) continue;
+    overwrites.push({
+      id: roleId,
+      allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory],
+    });
+  }
+  if (botMember) {
+    overwrites.push({
+      id: botMember.id,
+      allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory, PermissionsBitField.Flags.ManageChannels],
+    });
+  }
+  let channel = null;
+  if (match.channelId2) {
+    try {
+      channel = await guild.channels.fetch(match.channelId2);
+    } catch (e) { channel = null; }
+    if (channel && channel.type !== ChannelType.GuildText) channel = null;
+  }
+  if (!channel) {
+    channel = await guild.channels.create({
+      name: `🎮 room-${match.id.slice(-4)}`,
+      type: ChannelType.GuildText,
+      parent: category ? category.id : null,
+      permissionOverwrites: overwrites,
+    });
+  }
+  match.channelId2 = channel.id;
+  return channel;
+}
+
+async function deleteChannel(guild, match) {
+  const channel = guild.channels.cache.get(match.channelId2);
+  if (channel) {
+    await channel.delete().catch(e => note('delete', e));
+  }
+}
+
+async function archiveChannel(guild, match) {
+  const channel = guild.channels.cache.get(match.channelId2);
+  if (!channel) return;
+  const mode = config.modes[match.mode] || config.modes.amo;
+  const category = guild.channels.cache.get(mode.logsCategoryId);
+  const botMember = guild.members.me;
+
+  const overwrites = [
+    {
+      id: guild.id,
+      deny: [PermissionsBitField.Flags.ViewChannel],
+    }
+  ];
+  if (config.supervisorRoleId) {
+    overwrites.push({
+      id: config.supervisorRoleId,
+      allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.ReadMessageHistory, PermissionsBitField.Flags.SendMessages],
+    });
+  }
+  if (botMember) {
+    overwrites.push({
+      id: botMember.id,
+      allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory, PermissionsBitField.Flags.ManageChannels],
+    });
+  }
+
+  await channel.setParent(category ? category.id : null, { lockPermissions: false }).catch(e => note('channel-setup', e));
+  await channel.setName(`match-${match.id.slice(-5)}`).catch(e => note('channel-setup', e));
+  await channel.permissionOverwrites.set(overwrites).catch(e => note('perms', e));
+}
+
+async function movePlayersToVoice(guild, match, team1Channel, team2Channel) {
+  match.originalChannels = match.originalChannels || {};
+  const moveTeam = async (team, teamChannel) => {
+    for (const userId of team) {
+      if (!isRealId(userId)) continue;
+      try {
+        const member = await guild.members.fetch(userId);
+        if (!member.voice || !member.voice.channel) {
+          console.log(`[VOICE] match ${match.id}: player ${userId} is not in a voice channel — skipping move to ${teamChannel.name}`);
+          continue;
+        }
+        if (match.originalChannels[userId] === undefined) {
+          match.originalChannels[userId] = member.voice.channel.id;
+        }
+        await member.voice.setChannel(teamChannel);
+      } catch (e) {
+        console.log(`[VOICE] match ${match.id}: could not move user ${userId} to ${teamChannel.name}: ${e.message}`);
+      }
+    }
+  };
+  await moveTeam(match.team1, team1Channel);
+  await moveTeam(match.team2, team2Channel);
+  persistMatches();
+}
+
+async function returnPlayersToOriginal(guild, match) {
+  const entries = (match.originalChannels && typeof match.originalChannels === 'object')
+    ? Object.entries(match.originalChannels)
+    : [];
+  if (entries.length === 0) {
+    console.log(`[VOICE] match ${match.id}: no saved original voice channels — skipping restore`);
+    return { total: 0, restored: 0, skipped: 0, stuck: [] };
+  }
+  beginRestore(match);
+  let restored = 0;
+  const skipped = [];
+  const stuck = [];
+  try {
+    for (const [userId, channelId] of entries) {
+      if (!isRealId(userId) || !isRealId(channelId)) continue;
+      let member = null;
+      try {
+        member = await guild.members.fetch(userId);
+      } catch (e) {
+        console.log(`[VOICE] match ${match.id}: player ${userId} left the server / not found — skipped restore`);
+        skipped.push(userId);
+        continue;
+      }
+      if (!member.voice || !member.voice.channel) {
+        console.log(`[VOICE] match ${match.id}: player ${userId} is offline/not connected — not moved (saved original ${channelId})`);
+        skipped.push(userId);
+        continue;
+      }
+      const target = guild.channels.cache.get(channelId);
+      if (!target || target.type !== ChannelType.GuildVoice) {
+        console.log(`[VOICE] match ${match.id}: original voice channel ${channelId} for ${userId} no longer exists — nothing to restore`);
+        skipped.push(userId);
+        continue;
+      }
+      if (member.voice.channel.id === channelId) {
+        restored++;
+        continue;
+      }
+      try {
+        await member.voice.setChannel(target);
+        restored++;
+      } catch (e) {
+        console.log(`[VOICE] match ${match.id}: could not return player ${userId} to ${channelId} (inaccessible?) — ${e.message}`);
+        stuck.push(userId);
+      }
+    }
+  } finally {
+    endRestore(match);
+  }
+  const result = { total: entries.length, restored, skipped: skipped.length, stuck };
+  console.log(`[VOICE] match ${match.id}: restored ${restored}/${entries.length} player(s) to their original voice channels (skipped ${skipped.length}, stuck ${stuck.length})`);
+  return result;
+}
+
+async function restorePlayerVoice(guild, match, userId) {
+  if (!match.originalChannels || match.originalChannels[userId] === undefined) {
+    console.log(`[VOICE] match ${match.id}: no saved original voice channel for ${userId}`);
+    return { ok: false, reason: 'no-saved-original' };
+  }
+  const channelId = match.originalChannels[userId];
+  restoringPlayers.set(String(userId), { matchId: match.id, expiresAt: Date.now() + RESTORE_TTL_MS });
+  try {
+    let member;
+    try {
+      member = await guild.members.fetch(userId);
+    } catch (e) {
+      console.log(`[VOICE] match ${match.id}: cannot restore ${userId} — player not found / left server`);
+      return { ok: false, reason: 'player-not-found' };
+    }
+    if (!member.voice || !member.voice.channel) {
+      console.log(`[VOICE] match ${match.id}: ${userId} offline/not connected — nothing to restore`);
+      return { ok: true, reason: 'not-connected' };
+    }
+    const target = guild.channels.cache.get(channelId);
+    if (!target || target.type !== ChannelType.GuildVoice) {
+      console.log(`[VOICE] match ${match.id}: original channel ${channelId} for ${userId} no longer exists`);
+      return { ok: false, reason: 'channel-missing' };
+    }
+    if (member.voice.channel.id === channelId) return { ok: true, reason: 'already-there' };
+    await member.voice.setChannel(target);
+    return { ok: true };
+  } catch (e) {
+    console.log(`[VOICE] match ${match.id}: could not restore ${userId} to ${channelId}: ${e.message}`);
+    return { ok: false, reason: e.message };
+  }
+}
+
+async function verifyRestore(guild, match) {
+  const entries = Object.entries(match.originalChannels || {});
+  let verified = 0;
+  let skipped = 0;
+  const stuck = [];
+  for (const [userId, channelId] of entries) {
+    try {
+      const member = await guild.members.fetch(userId);
+      if (!member.voice || !member.voice.channel) {
+        skipped++;
+        continue;
+      }
+      if (member.voice.channel.id === channelId) verified++;
+      else stuck.push(userId);
+    } catch (e) {
+      skipped++;
+    }
+  }
+  console.log(`[VOICE] verify match ${match.id}: ${verified}/${entries.length} in original channels (${skipped} skipped, ${stuck.length} stuck)`);
+  return { total: entries.length, verified, skipped, stuck };
+}
+
+function findMatchByVoiceChannel(channelId) {
+  for (const match of activeMatches.values()) {
+    if ((match.voiceChannels || []).includes(channelId)) return match;
+  }
+  return null;
+}
+
+async function resolveChannel(guild, channelId) {
+  let ch = null;
+  try { ch = guild.channels.cache.get(channelId); } catch (e) { /* ignore */ }
+  if (!ch) {
+    try { ch = await guild.channels.fetch(channelId).catch(() => null); } catch (e) { ch = null; }
+  }
+  return ch;
+}
+
+async function finishMatch(guild, match) {
+  match.closing = true;
+  match.phase = 'FINISHING';
+  persistMatches();
+  // Guarded so a failure here cannot skip the channel cleanup below and leave
+  // orphaned voice channels in the server. cancelMatch already guarded the
+  // same call; this teardown path did not.
+  let restored = { total: 0, restored: 0, skipped: 0, stuck: [] };
+  try {
+    restored = await returnPlayersToOriginal(guild, match);
+  } catch (e) {
+    console.log(`[VOICE] match ${match.id}: restore failed during finish: ${e.message}`);
+  }
+  await verifyRestore(guild, match).catch(e => note('match-lifecycle', e));
+  await deleteVoiceChannels(guild, match);
+  await deleteChannel(guild, match);
+  match.phase = 'FINISHED';
+  match.closing = false;
+  removeMatch(match.id);
+  console.log(`[VOICE] match ${match.id} finished — restored ${restored.restored}/${restored.total}, channels cleaned up`);
+}
+
+async function clearVoiceChannelMessages(guild, channelId) {
+  try {
+    const channel = guild.channels.cache.get(channelId);
+    if (!channel || typeof channel.messages?.fetch !== 'function') return;
+    const msgs = await channel.messages.fetch({ limit: 100 }).catch(() => null);
+    if (!msgs || msgs.size === 0) return;
+    await channel.bulkDelete(msgs, true).catch(async () => {
+      for (const m of msgs.values()) await m.delete().catch(e => note('bulk-delete', e));
+    });
+    console.log(`[VOICE] cleared ${msgs.size} leftover message(s) in team voice channel ${channelId}`);
+  } catch (e) {
+    console.log(`[VOICE] could not clear messages in ${channelId}: ${e.message}`);
+  }
+}
+
+async function deleteVoiceChannels(guild, match) {
+  const allPlayers = [...new Set([...(match.team1 || []), ...(match.team2 || [])])];
+  match.closing = true;
+  suppressUsers(allPlayers);
+
+  if (match.usePool) {
+    const mode = match.mode || 'amo';
+    for (const channelId of match.voiceChannels) {
+      await clearVoiceChannelMessages(guild, channelId);
+      await deactivatePoolChannel(guild, channelId);
+    }
+    releasePoolInUse(mode, match.voiceChannels);
+    match.voiceChannels = [];
+    match.usePool = false;
+    match.originalChannels = {};
+    endRestore(match);
+    return;
+  }
+
+  for (const channelId of match.voiceChannels) {
+    try {
+      await clearVoiceChannelMessages(guild, channelId);
+      const channel = guild.channels.cache.get(channelId);
+      if (channel) await channel.delete();
+    } catch (e) {
+      console.log(`Could not delete voice channel ${channelId}: ${e.message}`);
+    }
+  }
+  match.voiceChannels = [];
+  match.originalChannels = {};
+  endRestore(match);
+}
+
+function removeMatch(matchId) {
+  activeMatches.delete(matchId);
+  persistMatches();
+}
+
+function getAllMatches() {
+  cleanupExpired();
+  return Array.from(activeMatches.values()).filter(m => m.status === 'waiting' || m.status === 'full');
+}
+
+function getActiveMatchForPlayer(userId) {
+  cleanupExpired();
+  return Array.from(activeMatches.values()).find(m =>
+    (m.status === 'full') &&
+    (m.team1.includes(userId) || m.team2.includes(userId))
+  ) || null;
+}
+
+function getPendingOrFullMatch(mode) {
+  cleanupExpired();
+  const candidates = Array.from(activeMatches.values())
+    .filter(m =>
+      m.status === 'waiting' && m.roomId !== null && !isTeamsFull(m.id) &&
+      (mode ? m.mode === mode : true)
+    )
+    .sort((a, b) => b.createdAt - a.createdAt);
+  return candidates[0] || null;
+}
+
+async function clearAllMatches(guild) {
+  const matches = getAllMatches();
+  if (guild) {
+    for (const match of matches) {
+      try {
+        await returnPlayersToOriginal(guild, match);
+        await deleteVoiceChannels(guild, match);
+        await deleteChannel(guild, match);
+      } catch (e) {
+        console.log(`[CLEAR] cleanup of match ${match.id} failed: ${e.message}`);
+      }
+    }
+  }
+  const count = matches.length;
+  activeMatches.clear();
+  persistMatches();
+  return count;
+}
+
+function endMatch(matchId) {
+  const match = activeMatches.get(matchId);
+  if (match) {
+    match.status = 'ended';
+  }
+}
+
+function getVoicePoolSize() { return VOICE_POOL_SIZE; }
+
+module.exports = {
+  createMatch,
+  persistMatches,
+  touchMatch,
+  getMatch,
+  getMatchByChannel,
+  getMatchByCreator,
+  joinTeam,
+  leaveMatch,
+  getPlayerTeam,
+  isTeamsFull,
+  createVoiceChannels,
+  createChannel,
+  deleteChannel,
+  archiveChannel,
+  movePlayersToVoice,
+  returnPlayersToOriginal,
+  restorePlayerVoice,
+  verifyRestore,
+  beginRestore,
+  endRestore,
+  endRestoreUser,
+  isRestoring,
+  clearOriginalChannel,
+  findMatchByVoiceChannel,
+  finishMatch,
+  deleteVoiceChannels,
+  removeMatch,
+  getAllMatches,
+  getPendingOrFullMatch,
+  getActiveMatchForPlayer,
+  isSuppressed,
+  validateMatch,
+  validateAllMatches,
+  logMatch,
+  getMatchLogs,
+  clearAllMatches,
+  endMatch,
+  ensureVoicePool,
+  getVoicePoolSize
+};
